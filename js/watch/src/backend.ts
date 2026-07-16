@@ -4,8 +4,12 @@ import * as Audio from "./audio";
 import type { Broadcast } from "./broadcast";
 import type { BufferedRanges } from "./buffered";
 import { Muxer } from "./mse";
-import { type Latency, Sync } from "./sync";
+import { type Bound, type Latency, latencyBounds, Sync } from "./sync";
 import * as Video from "./video";
+
+// How long the latency target must hold steady before a floor increase re-anchors. Coalesces a
+// slider drag (many small steps) into a single re-anchor once the user settles on a value.
+const LATENCY_REANCHOR_DEBOUNCE_MS = 150;
 
 export interface Backend {
 	// Whether audio/video playback is paused.
@@ -119,6 +123,10 @@ export class MultiBackend implements Backend {
 	// The active WebCodecs audio decoder, used to flush the buffer on `reset()`.
 	#audioDecoder?: Audio.Decoder;
 
+	// The latency floor as of the last settled change, to detect a floor *increase* (which needs
+	// a deeper cushion) versus a decrease or real-time RTT wiggle. See #runLatencyReanchor.
+	#prevFloor?: Bound;
+
 	// Used to sync audio and video playback at a target delay.
 	sync: Sync;
 
@@ -149,6 +157,7 @@ export class MultiBackend implements Backend {
 		this.visible = Signal.from(props?.visible ?? "20%");
 
 		this.signals.run(this.#runElement.bind(this));
+		this.signals.run(this.#runLatencyReanchor.bind(this));
 	}
 
 	#runElement(effect: Effect): void {
@@ -225,6 +234,32 @@ export class MultiBackend implements Backend {
 		effect.proxy(this.audio.stats, audio.stats);
 		effect.proxy(this.audio.buffered, audio.buffered);
 		effect.proxy(this.audio.context, audio.context);
+	}
+
+	// Re-anchor when the latency floor *increases*. A larger floor needs a deeper cushion: video
+	// rebuilds it implicitly (its per-frame `sync.wait()` reads the live buffer, so it just holds
+	// longer), but the audio ring keeps draining at its old depth unless re-stalled, so audio
+	// would run ahead of video (the classic "raise latency, only video re-buffers" desync).
+	// `reset()` re-anchors both from a common reference and re-stalls the audio ring so it refills
+	// to the new floor. We watch the latency *target* (not the derived buffer), so real-time RTT
+	// jitter never triggers this, and debounce so a slider drag (many small steps) coalesces into
+	// one re-anchor once it settles. Decreases are left alone: catch-up is handled by natural
+	// playback and the ring dropping its oldest samples past the cap.
+	#runLatencyReanchor(effect: Effect): void {
+		const floor = latencyBounds(effect.get(this.latency)).min;
+		if (this.#prevFloor === undefined) {
+			// Startup: the initial fill already builds the cushion; just record the baseline.
+			this.#prevFloor = floor;
+			return;
+		}
+		const baseline = this.#prevFloor;
+		const timer = setTimeout(() => {
+			const settled = latencyBounds(this.latency.peek()).min;
+			const toMs = (b: Bound): number => (b === "real-time" ? 0 : b);
+			if (toMs(settled) > toMs(baseline)) this.reset();
+			this.#prevFloor = settled;
+		}, LATENCY_REANCHOR_DEBOUNCE_MS);
+		effect.cleanup(() => clearTimeout(timer));
 	}
 
 	// Re-anchor playback at an utterance boundary in buffered mode: reset the sync reference
